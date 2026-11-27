@@ -1,0 +1,929 @@
+'use strict';
+
+// Railway sets RAILWAY_VOLUME_MOUNT_PATH when a Volume is attached: use it automatically, so the WhatsApp session
+// (and settings/schedules) survive redeploys even if STORAGE_DIR was never set.
+if (!process.env.STORAGE_DIR && process.env.RAILWAY_VOLUME_MOUNT_PATH) process.env.STORAGE_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+
+// Must run BEFORE Baileys is loaded (fixes "No sessions" send failures on @lid accounts).
+try { require('./scripts/patch-baileys'); } catch (e) { console.error('[patch-baileys] failed:', e.message); }
+
+// libsignal prints huge "Closing session: SessionEntry {...}" dumps and Bad MAC traces to the console.
+// They are normal key-renegotiation noise; hide them so real errors are visible, and just count them.
+const SIGNAL_NOISE = /^(Closing session|Closing open session|Opening session|Removing old closed session|Migrating session|Decrypted message with closed session|Failed to decrypt message with any known session|Session error:)/;
+const stats = { noise: 0, msgs: 0, lastMsgAt: 0, pingFails: 0 };
+for (const m of ['log', 'info', 'warn', 'error']) {
+  const orig = console[m].bind(console);
+  console[m] = (...a) => { if (typeof a[0] === 'string' && SIGNAL_NOISE.test(a[0])) { stats.noise++; return; } orig(...a); };
+}
+process.on('unhandledRejection', err => console.error('[UNHANDLED REJECTION]', err?.stack || err));
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const express = require('express');
+const P = require('pino');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  jidNormalizedUser,
+  getContentType,
+  fetchLatestBaileysVersion,
+  Browsers,
+  downloadContentFromMessage,
+  WAMessageStubType,
+} = require('@whiskeysockets/baileys');
+const { File } = require('megajs');
+const qrcode = require('qrcode-terminal');
+const config = require('./config');
+const { sms } = require('./lib/msg');
+const { getGroupAdmins, runtime } = require('./lib/functions');
+const { commands, replyHandlers } = require('./command');
+const interactive = require('./lib/interactive');
+const welcomePolicy = require('./lib/welcome');
+
+const ROOT = __dirname;
+const STORAGE_DIR = process.env.STORAGE_DIR || ROOT;
+const DATA_DIR = path.join(STORAGE_DIR, 'data');
+const SESSIONS_DIR = path.join(STORAGE_DIR, 'sessions');
+const LEGACY_SESSION_DIR = path.join(STORAGE_DIR, 'auth_info_baileys');
+// Baileys encrypts outgoing media into os.tmpdir(). On Railway/PaaS, /tmp is
+// small and ephemeral, so a big film used to fail upload with ENOSPC even when
+// the volume had room. Keep that temporary copy on the storage volume instead.
+if (process.platform !== 'win32' && !process.env.TMPDIR) {
+  const mediaTmp = path.join(STORAGE_DIR, 'tmp');
+  try {
+    fs.mkdirSync(mediaTmp, { recursive: true });
+    process.env.TMPDIR = mediaTmp;
+  } catch { /* keep the platform default if the volume is not writable */ }
+}
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const PORT = Number(process.env.PORT || 8000);
+const PREFIX = process.env.PREFIX || '.';
+// Keep the account's "online" presence alive while the bot is connected.
+// WhatsApp shows the linked account online when one of its devices reports
+// "available". Set ALWAYS_ONLINE=false to let the phone control presence.
+const ALWAYS_ONLINE = String(process.env.ALWAYS_ONLINE || 'true').toLowerCase() !== 'false';
+const presence = require('./lib/presence');   // same flag, shared with the .online command
+const { decideConnectNotice, pruneBoots } = require('./lib/connectNotice');
+const logger = P({ level: process.env.LOG_LEVEL || 'info' });
+const sockets = new Map();
+const reconnectTimers = new Map();
+const reconnectAttempts = new Map();
+const presenceTimers = new Map();
+const autoReplied = new Map();             // jid -> last auto-reply timestamp (one per hour)
+let settings = { mode: process.env.BOT_MODE === 'private' ? 'private' : 'public', welcome: true, goodbye: true, welcomeText: '', goodbyeText: '', groupWelcome: {}, antiDelete: true, autoReact: false, autoReactEmoji: '❤️', autoStatus: false, autoReply: false, autoReplyText: '', mutedGroups: [], dmGreeting: true, greetedUsers: [], welcomedUsers: [] };
+const recentMessages = new Map();
+const MAX_CACHED_MESSAGES = 1500;
+const ANTIDELETE_CACHE_FILE = path.join(DATA_DIR, 'antidelete-cache.json');
+const ANTIDELETE_CACHE_MAX_PERSIST = 500;
+const ANTIDELETE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+try {
+  const saved = JSON.parse(fs.readFileSync(ANTIDELETE_CACHE_FILE, 'utf8'));
+  const now = Date.now();
+  for (const [k, v] of Object.entries(saved || {})) {
+    if (v && now - Number(v.timestamp || 0) <= ANTIDELETE_CACHE_TTL_MS) recentMessages.set(k, v);
+  }
+} catch { /* first run */ }
+let antiDeleteSaveTimer = null;
+function scheduleAntiDeleteSave() {
+  clearTimeout(antiDeleteSaveTimer);
+  antiDeleteSaveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const entries = [...recentMessages.entries()].slice(-ANTIDELETE_CACHE_MAX_PERSIST);
+      const tmp = `${ANTIDELETE_CACHE_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(entries)), { mode: 0o600 });
+      fs.renameSync(tmp, ANTIDELETE_CACHE_FILE);
+    } catch { /* best effort */ }
+  }, 3000);
+  antiDeleteSaveTimer.unref?.();
+}
+// Anti-delete / anti-edit support (session-only; resets on restart, same as recentMessages).
+const contactNames = new Map(); // jid -> saved/pushed contact name, learned from WhatsApp contact sync
+const senderDeleteCounts = new Map(); // jid -> number of deleted messages observed this session
+const senderEditCounts = new Map(); // jid -> number of edited messages observed this session
+function extractPreviewText(messageContent) {
+  if (!messageContent) return '';
+  if (typeof messageContent.conversation === 'string') return messageContent.conversation;
+  const mt = getContentType(messageContent);
+  const wrapped = messageContent[mt];
+  return messageContent.extendedTextMessage?.text || wrapped?.caption || '';
+}
+/** Baileys gives Long objects; accept both Long and primitive timestamps. */
+function messageTimeMs(message) {
+  const raw = message?.messageTimestamp;
+  const value = typeof raw?.toNumber === 'function' ? raw.toNumber() : Number(raw);
+  return Number.isFinite(value) ? value * 1000 : 0;
+}
+// WhatsApp now hides phone numbers behind "@lid" ids. Learn LID -> phone-number pairs from whatever WhatsApp tells us
+// (message keys, phone-number-share events, contact sync) and keep them on disk, so notices can show the real number.
+const LID_FILE = path.join(DATA_DIR, 'lid-map.json');
+const lidMap = new Map();
+try { for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(LID_FILE, 'utf8')))) lidMap.set(k, v); } catch { /* first run */ }
+let lidSaveTimer = null;
+function rememberLid(lid, pn) {
+  const l = normalizeJid(lid || ''), p = normalizeJid(pn || '');
+  if (!l.endsWith('@lid') || !p.endsWith('@s.whatsapp.net') || lidMap.get(l) === p) return;
+  lidMap.set(l, p);
+  clearTimeout(lidSaveTimer);
+  lidSaveTimer = setTimeout(() => { try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(LID_FILE, JSON.stringify(Object.fromEntries(lidMap))); } catch { /* best effort */ } }, 2000);
+  lidSaveTimer.unref?.();
+}
+function phoneFor(jid) { return jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0] : (lidMap.get(jid) || '').split('@')[0]; }
+const TZ_MIN = Number(process.env.TZ_OFFSET_MIN || 330);
+function fmtTime(ms) { const t = new Date(ms + TZ_MIN * 60000); const p = n => String(n).padStart(2, '0'); return `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())} ${p(t.getUTCHours())}:${p(t.getUTCMinutes())}:${p(t.getUTCSeconds())}`; }
+// Who is this? name, real number when known, plus a WhatsApp @mention (the app itself resolves it to the person's name/number).
+function describePerson(jid, pushName) {
+  const name = displayNameFor(jid, pushName);
+  const phone = phoneFor(jid);
+  const tag = `@${jid.split('@')[0]}`;
+  const lines = [`👤 Name: ${name}`];
+  lines.push(phone ? `📞 Number: +${phone}  (wa.me/${phone})` : '📞 Number: WhatsApp hides it (LID) — tap the mention below');
+  lines.push(`🔖 Tap: ${tag}`);
+  return { text: lines.join('\n'), mentions: [jid] };
+}
+function displayNameFor(jid, fallbackPushName) {
+  return contactNames.get(jid) || (fallbackPushName && fallbackPushName.trim()) || jid.split('@')[0];
+}
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  try { supabase = require('@supabase/supabase-js').createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false, autoRefreshToken: false } }); }
+  catch (e) { logger.warn({ err: e }, 'Supabase client unavailable'); }
+}
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+
+// Boot cleanup: one failed film download leaves a full-size .part behind, and Railway's volume is only
+// ~450 MB — a single stale partial file then makes EVERY later download fail with ENOSPC (and can crash
+// the process mid-write). Clear the leftovers at startup so the volume never stays full.
+(function bootCleanup() {
+  // 1) Baileys writes its encrypted outgoing copy into os.tmpdir(). When Railway mounts a volume at
+  //    /data it also points TMPDIR at /data/tmp, so one 777 MB film leaves a 443 MB "document…-enc"
+  //    file there and the 454 MB volume is instantly full (ENOSPC, even for settings.json).
+  //    Everything in <STORAGE_DIR>/tmp is disposable, so wipe the whole directory.
+  for (const tmpDir of [path.join(STORAGE_DIR, 'tmp'), '/data/tmp']) {
+    try {
+      if (!fs.existsSync(tmpDir)) continue;
+      for (const file of fs.readdirSync(tmpDir)) {
+        const full = path.join(tmpDir, file);
+        try {
+          const st = fs.statSync(full);
+          if (!st.isFile()) continue;
+          fs.rmSync(full, { force: true });
+          console.log(`[CLEANUP] wiped temp file ${full} (${Math.round(st.size / 1e6)} MB)`);
+        } catch { }
+      }
+    } catch { }
+  }
+  // 2) leftover download files (.part / old .mp4) from a crashed job
+  const dirs = [...new Set([
+    process.env.FILM_DOWNLOAD_DIR || path.join(STORAGE_DIR, 'data', 'films'),
+    path.join(STORAGE_DIR, 'data', 'films'),
+    '/tmp/films',
+  ])];
+  for (const dir of dirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const file of fs.readdirSync(dir)) {
+        const full = path.join(dir, file);
+        try {
+          const st = fs.statSync(full);
+          if (!st.isFile()) continue;
+          if (/\.(part|tmp)$/i.test(file) || (/\.[a-z0-9]{2,4}$/i.test(file) && Date.now() - st.mtimeMs > 60000)) {
+            fs.rmSync(full, { force: true });
+            console.log(`[CLEANUP] removed stale download file ${full} (${Math.round(st.size / 1e6)} MB)`);
+          }
+        } catch { }
+      }
+    } catch { }
+  }
+})();
+if (fs.existsSync(SETTINGS_FILE)) {
+  try { settings = { ...settings, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; }
+  catch (e) { logger.warn({ err: e }, 'Invalid settings.json; defaults will be used'); }
+}
+// .online off/on is saved in settings.json — apply it at boot so a restart does not flip presence back
+if (typeof settings.alwaysOnline === 'boolean') presence.set(settings.alwaysOnline);
+// Record this boot so a restart storm can be reported once instead of one notice per restart
+// (see lib/connectNotice.js — that spam is what looked like a scheduled 10-minute self-chat message).
+settings.bootTimes = pruneBoots(settings.bootTimes, Date.now());
+if (typeof settings.noticeAnnouncedOnce !== 'boolean') settings.noticeAnnouncedOnce = false;
+function saveSettings() {
+  const tmp = `${SETTINGS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2));
+  fs.renameSync(tmp, SETTINGS_FILE);
+}
+function safeId(value) {
+  const id = String(value || 'default');
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(id)) throw new Error(`Invalid account id: ${id}`);
+  return id;
+}
+function readAccounts() {
+  if (process.env.BOT_ACCOUNTS) {
+    let parsed;
+    try { parsed = JSON.parse(process.env.BOT_ACCOUNTS); }
+    catch { throw new Error('BOT_ACCOUNTS must be valid JSON (array of account objects).'); }
+    if (!Array.isArray(parsed) || !parsed.length) throw new Error('BOT_ACCOUNTS must be a non-empty JSON array.');
+    const ids = new Set();
+    return parsed.map((item, index) => {
+      const id = safeId(item.id || `account${index + 1}`);
+      if (ids.has(id)) throw new Error(`Duplicate account id: ${id}`);
+      ids.add(id);
+      return { id, ownerNumber: String(item.ownerNumber || process.env.BOT_OWNER || config.BOT_OWNER || '').replace(/\D/g, ''), sessionId: item.sessionId || '', sessionPath: path.join(SESSIONS_DIR, id) };
+    });
+  }
+  // Backward compatibility: use the original session directory and SESSION_ID.
+  return [{ id: 'default', ownerNumber: String(process.env.BOT_OWNER || config.BOT_OWNER || '').replace(/\D/g, ''), sessionId: config.SESSION_ID || '', sessionPath: LEGACY_SESSION_DIR, legacy: true }];
+}
+async function restoreMegaSession(sessionId, sessionPath) {
+  const creds = path.join(sessionPath, 'creds.json');
+  if (fs.existsSync(creds)) return;
+  if (!sessionId) { logger.info({ sessionPath }, 'No imported session configured; waiting for QR pairing'); return; }
+  fs.mkdirSync(sessionPath, { recursive: true });
+  logger.info('Restoring session archive from MEGA');
+  const url = sessionId.startsWith('http') ? sessionId : `https://mega.nz/file/${sessionId}`;
+  const file = File.fromURL(url);
+  const data = await new Promise((resolve, reject) => file.download((err, buffer) => err ? reject(err) : resolve(buffer)));
+  // SESSION_ID must point to a Baileys creds.json file, not a full multi-file auth directory archive.
+  fs.writeFileSync(creds, data);
+}
+function unwrapMessage(message) {
+  let current = message;
+  while (current) {
+    const type = getContentType(current);
+    if (type === 'ephemeralMessage') current = current.ephemeralMessage?.message;
+    // Our own quick replies use a viewOnceMessage transport wrapper. It is not
+    // view-once media; unwrap it so it is not mistaken for protected content.
+    else if (VIEW_ONCE_TYPES.has(type) && isInteractiveWrapper(current)) current = current[type]?.message;
+    // Deliberately do not unwrap real view-once payloads: respect the sender's one-time media setting.
+    else break;
+  }
+  return current || message;
+}
+const VIEW_ONCE_TYPES = new Set(['viewOnceMessage','viewOnceMessageV2','viewOnceMessageV2Extension']);
+const INTERACTIVE_CONTENT_TYPES = new Set(['interactiveMessage','interactiveResponseMessage','buttonsResponseMessage','templateButtonReplyMessage','listResponseMessage']);
+function isInteractiveWrapper(message) {
+  const type = getContentType(message);
+  if (!VIEW_ONCE_TYPES.has(type)) return false;
+  const inner = message?.[type]?.message;
+  return !!inner && INTERACTIVE_CONTENT_TYPES.has(getContentType(inner));
+}
+function loadPlugins() {
+  const pluginDir = path.join(ROOT, 'plugins');
+  for (const file of fs.readdirSync(pluginDir).filter(f => f.endsWith('.js')).sort()) {
+    require(path.join(pluginDir, file));
+    logger.info(`Loaded plugin: ${file}`);
+  }
+}
+function normalizeJid(jid) { return jidNormalizedUser(String(jid || '')); }
+function getTargetJid(m, q, sender) {
+  const mentioned = m.mentionUser?.find(j => j && j !== sender);
+  if (mentioned) return normalizeJid(mentioned);
+  if (m.quoted?.sender) return normalizeJid(m.quoted.sender);
+  const number = String(q || '').replace(/\D/g, '');
+  return number.length >= 7 ? `${number}@s.whatsapp.net` : null;
+}
+
+loadPlugins();
+
+async function handleMessage(sock, account, incoming) {
+  if (!incoming?.message || incoming.key?.remoteJid === 'status@broadcast') return;
+  const rawMessage = incoming.message;
+  let probe = rawMessage;
+  while (probe && getContentType(probe) === 'ephemeralMessage') probe = probe.ephemeralMessage?.message;
+  const rawType = getContentType(probe || rawMessage);
+  const isViewOnce = VIEW_ONCE_TYPES.has(rawType) && !isInteractiveWrapper(probe || rawMessage);
+  incoming.message = unwrapMessage(rawMessage);
+  if (isViewOnce) {
+    const accountOwner = account.ownerNumber ? `${account.ownerNumber}@s.whatsapp.net` : '';
+    if (accountOwner) await sock.sendMessage(accountOwner, { text: `🔒 View-once media received in ${incoming.key.remoteJid}. Reply to it with ${PREFIX}vv to view in self-chat (held temporarily in memory while online).` }).catch(() => {});
+    return;
+  }
+  const m = sms(sock, incoming);
+  const from = incoming.key.remoteJid;
+  const body = String(m.body || '').trim();
+  const isCmd = body.startsWith(PREFIX);
+  const pieces = isCmd ? body.slice(PREFIX.length).trim().split(/\s+/) : [];
+  const commandName = (pieces.shift() || '').toLowerCase();
+  const args = pieces;
+  const q = args.join(' ');
+  const sender = normalizeJid(m.sender || incoming.key.participant || from);
+  const senderNumber = sender.split('@')[0].split(':')[0];
+  const isGroup = from.endsWith('@g.us');
+  if (isGroup && settings.mutedGroups.includes(from) && commandName !== 'mute' && !incoming.key.fromMe && !(account.ownerNumber && account.ownerNumber === String(sender).split('@')[0].split(':')[0])) return;
+  const botNumber = String(sock.user?.id || '').split(':')[0].split('@')[0];
+  const isMe = Boolean(incoming.key.fromMe) || senderNumber === botNumber;
+  const isOwner = isMe || (account.ownerNumber && account.ownerNumber === senderNumber);
+  const groupMetadata = isGroup ? await sock.groupMetadata(from).catch(() => null) : null;
+  const participants = groupMetadata?.participants || [];
+  const groupAdmins = isGroup ? getGroupAdmins(participants).map(normalizeJid) : [];
+  const botJid = normalizeJid(sock.user?.id || '');
+  // New WhatsApp groups use LID addressing, so admin ids are '...@lid' while sock.user.id is a phone JID.
+  // Compare against BOTH of the bot's identities, otherwise ".kick" always says "make the bot an admin first".
+  const botLid = normalizeJid(sock.user?.lid || '');
+  const botIds = [botJid, botLid].filter(Boolean);
+  const isBotAdmins = isGroup && botIds.some(j => groupAdmins.includes(j));
+  const isAdmins = isGroup && groupAdmins.includes(sender);
+  const reply = (text, options = {}) => sock.sendMessage(from, { text: String(text), ...options }, { quoted: incoming }).catch(err => { console.error(`[SEND FAILED] to ${from} ->`, err?.message || err); throw err; });
+
+  if (settings.mode === 'private') {
+    // Private means owner self-chat only; do not accept other private chats or groups.
+    const ownerJid = account.ownerNumber ? `${account.ownerNumber}@s.whatsapp.net` : '';
+    if (!ownerJid || from !== ownerJid || !(incoming.key.fromMe || senderNumber === account.ownerNumber)) return;
+  }
+
+  // ── auto-reply (one per chat per hour, private chats only, never to commands) ──
+  if (!isGroup && !incoming.key.fromMe && settings.autoReply && settings.autoReplyText && body && !isCmd) {
+    const last = autoReplied.get(from) || 0;
+    if (Date.now() - last > 60 * 60 * 1000) {
+      autoReplied.set(from, Date.now());
+      reply(settings.autoReplyText).catch(() => { });
+    }
+  }
+
+  const context = {
+    from, quoted: incoming, body, isCmd, command: commandName, args, q, isGroup, sender, prefix: PREFIX,
+    senderNumber, botNumber, botNumber2: botJid, botIds, pushname: incoming.pushName || 'WhatsApp User',
+    isMe, isOwner, groupMetadata, groupName: groupMetadata?.subject || '', participants,
+    groupAdmins, isBotAdmins, isAdmins, reply, accountId: account.id, settings,
+    getTargetJid: () => getTargetJid(m, q, sender),
+  };
+
+  // Buttons/lists and follow-up prompts are handled before text command
+  // dispatch. Ordinary messages and all existing prefix commands pass through.
+  try {
+    if (await interactive.handle({ sock, account, incoming, m, context })) return;
+  } catch (err) {
+    logger.error({ err, accountId: account.id }, 'Interactive handler failed');
+  }
+
+  if (isCmd && commandName) {
+    const plugin = commands.find(c => String(c.pattern || '').toLowerCase() === commandName || (c.alias || []).map(a => String(a).toLowerCase()).includes(commandName));
+    if (plugin) {
+      if (plugin.fromMe && !isOwner) return reply('⛔ Owner only command.');
+      // One-time welcome: only when someone uses a bot command for the FIRST time (never for normal chat messages).
+      if (!isGroup && !incoming.key.fromMe && !isOwner && settings.dmGreeting && !settings.welcomedUsers.includes(sender)) {
+        settings.welcomedUsers.push(sender);
+        if (settings.welcomedUsers.length > 5000) settings.welcomedUsers.splice(0, settings.welcomedUsers.length - 5000);
+        saveSettings();
+        const greeting = (config.GREETING_MSG && config.GREETING_MSG.trim()) || [
+          `ආයුබෝවන්${incoming.pushName ? `, ${incoming.pushName}` : ''}! 👋`,
+          `මේ *${config.BOT_NAME}* — ${config.OWNER_NAME} ගේ WhatsApp bot එක. 🤖`,
+          `මොනවද කරන්න පුළුවන් කියලා බලන්න *${PREFIX}menu* කියලා යවන්න.`,
+        ].join('\n');
+        await sock.sendMessage(from, { text: greeting }).catch(err => logger.debug({ err: err.message }, 'Welcome message failed'));
+      }
+      // React only to recognized bot commands, never to ordinary chat messages (plugins can opt out with silent: true).
+      const reactEmoji = plugin.silent ? '' : (plugin.react || (settings.autoReact ? settings.autoReactEmoji : ''));
+      if (reactEmoji) await sock.sendMessage(from, { react: { text: String(reactEmoji).slice(0, 16), key: incoming.key } }).catch(() => {});
+      try { await plugin.function(sock, incoming, m, context); }
+      catch (err) { console.error(`[COMMAND FAILED] .${commandName} ->`, err?.stack || err); logger.error({ err, commandName, accountId: account.id }, 'Command failed'); await reply('❌ Command failed. Check the bot logs.').catch(() => {}); }
+    } else {
+      await reply(`❓ Unknown command: ${PREFIX}${commandName}\nUse ${PREFIX}menu to see available commands.`).catch(() => {});
+    }
+  }
+  for (const handler of replyHandlers) {
+    try {
+      if (handler.filter(body, { sender, message: incoming })) {
+        await handler.function(sock, incoming, m, { ...context, body });
+        break;
+      }
+    } catch (err) { logger.error({ err, accountId: account.id }, 'Reply handler failed'); }
+  }
+}
+
+// ── credential safety net ────────────────────────────────────────────────────────────────────────────
+// useMultiFileAuthState rewrites creds.json in place, so a hard kill mid-write can leave invalid JSON and
+// the next boot would demand a fresh QR. Keep one verified copy and restore from it: additive only — this
+// never deletes or regenerates a session, it just refuses to let a half-written file win.
+function readJsonMaybe(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
+function protectSession(sessionPath, log) {
+  const creds = path.join(sessionPath, 'creds.json');
+  const backup = path.join(sessionPath, 'creds.json.bak');
+  try {
+    if (!fs.existsSync(creds)) {
+      if (fs.existsSync(backup) && readJsonMaybe(backup)) {
+        fs.copyFileSync(backup, creds);
+        log?.warn?.('[SESSION] creds.json missing — restored the verified backup (no re-pair needed)');
+      }
+      return;
+    }
+    if (readJsonMaybe(creds)) return;                       // healthy
+    if (readJsonMaybe(backup)) {
+      fs.copyFileSync(backup, creds);
+      log?.warn?.('[SESSION] creds.json was corrupt — restored the verified backup (no re-pair needed)');
+    } else {
+      log?.warn?.('[SESSION] creds.json is corrupt and no verified backup exists — a new pairing may be required');
+    }
+  } catch (err) { log?.warn?.({ err: err.message }, '[SESSION] credential check failed'); }
+}
+function backupSession(sessionPath, log) {
+  try {
+    const creds = path.join(sessionPath, 'creds.json');
+    if (!readJsonMaybe(creds)) return;
+    fs.copyFileSync(creds, path.join(sessionPath, 'creds.json.bak'));
+  } catch (err) { log?.debug?.({ err: err.message }, '[SESSION] backup copy failed'); }
+}
+
+async function connectAccount(account) {
+  const id = account.id;
+  if (sockets.has(id)) return;
+  try {
+    fs.mkdirSync(account.sessionPath, { recursive: true });
+    {
+      const hasCreds = fs.existsSync(path.join(account.sessionPath, 'creds.json'));
+      const onRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+      console.log(`[SESSION] path=${account.sessionPath} | saved login: ${hasCreds ? 'FOUND (will reuse it)' : 'NOT FOUND (new pairing needed)'}`);
+      if (onRailway && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.STORAGE_DIR) {
+        console.error('[SESSION] ⚠️ No Railway Volume attached: the WhatsApp login is wiped on EVERY deploy, and each deploy leaves a ghost linked device behind (that is what causes "No sessions" errors). Add a Volume (mount path /data).');
+      }
+    }
+    await restoreMegaSession(account.sessionId, account.sessionPath);
+    const { state, saveCreds } = await useMultiFileAuthState(account.sessionPath);
+    protectSession(account.sessionPath, logger);   // never let a half-written creds.json force a re-pair
+    const { version } = await fetchLatestBaileysVersion();
+    // Keep what we sent for a while: when a phone/device cannot decrypt a message it asks us to send it again, and
+    // without getMessage() we cannot, so the chat is stuck on "Waiting for this message. This may take a while".
+    const sentCache = new Map();
+    const rememberSent = res => {
+      if (res?.key?.id && res.message) {
+        sentCache.set(res.key.id, res.message);
+        if (sentCache.size > 1000) sentCache.delete(sentCache.keys().next().value);
+      }
+      return res;
+    };
+    const sock = makeWASocket({
+      getMessage: async key => sentCache.get(key?.id) || undefined,
+      logger: P({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' }),
+      printQRInTerminal: false,
+      browser: Browsers.macOS('Firefox'),
+      auth: state,
+      version,
+      syncFullHistory: false,
+      markOnlineOnConnect: presence.online,
+      generateHighQualityLinkPreview: false,
+    });
+    // Self-chat addressing. WhatsApp now addresses chats by "@lid", so messages to our OWN chat are sent to the LID first
+    // (that is what the phone expects; the phone-number JID can show up as "Waiting for this message" on the phone).
+    // If that fails with "No sessions" we retry with the phone JID. SELF_ADDRESS=pn flips the order.
+    {
+      const origSend = sock.sendMessage.bind(sock);
+      let hinted = 0;
+      const preferPn = String(process.env.SELF_ADDRESS || 'lid').toLowerCase() === 'pn';
+      sock.sendMessage = async (jid, content, options) => {
+        const pn = normalizeJid(sock.user?.id || ''), lid = normalizeJid(sock.user?.lid || '');
+        const n = normalizeJid(jid);
+        let order;
+        if (n && pn && lid && (n === pn || n === lid)) order = preferPn ? [pn, lid] : [lid, pn];
+        else { order = [jid]; const alt = lidMap.get(n); if (alt && alt !== n) order.push(alt); }   // stranger LID -> learned phone JID
+        let lastErr;
+        for (const target of order) {
+          try { return rememberSent(await origSend(target, content, options)); }
+          catch (err) { lastErr = err; if (!/No sessions/i.test(err?.message || '')) throw err; }
+        }
+        if (Date.now() - hinted > 3600000) {
+          hinted = Date.now();
+          console.error('[HINT] "No sessions" = this WhatsApp account has a stale/extra linked device (usually left behind by an earlier deploy). Phone > WhatsApp > Linked devices: log out every old "Firefox" entry, keep only the one bot that is running now.');
+        }
+        throw lastErr;
+      };
+    }
+    let pairingRequested = false;
+    sockets.set(id, sock);
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', async update => {
+      if (update.qr) {
+        // QR is the DEFAULT login: the owner scans it with the phone camera. A pairing code is only
+        // requested when PAIRING_NUMBER is set explicitly (the code path needs a phone number typed into
+        // WhatsApp; the QR needs nothing). The QR string is also written to data/qr.txt so the host can
+        // render it as an image and hand it to the owner in chat.
+        const pairNumber = String(process.env.PAIRING_NUMBER || '').replace(/\D/g, '');
+        if (pairNumber && !sock.authState?.creds?.registered) {
+          if (!pairingRequested) {
+            pairingRequested = true;
+            setTimeout(async () => {
+              try {
+                const raw = await sock.requestPairingCode(pairNumber);
+                const code = String(raw).match(/.{1,4}/g)?.join('-') || raw;
+                console.log(`\n========== WHATSAPP PAIRING CODE: ${code} ==========\nWhatsApp > Linked devices > Link a device > "Link with phone number instead" > enter this code\n`);
+              } catch (err) { pairingRequested = false; logger.warn({ err: err.message, accountId: id }, 'Pairing code request failed'); }
+            }, 3000);
+          }
+        } else {
+          logger.info({ accountId: id }, 'Scan this QR with WhatsApp > Linked devices > Link a device');
+          try {
+            fs.mkdirSync(DATA_DIR, { recursive: true });
+            fs.writeFileSync(path.join(DATA_DIR, 'qr.txt'), String(update.qr), { mode: 0o600 });
+          } catch (err) { logger.warn({ err: err?.message || err, accountId: id }, 'could not save the QR string'); }
+          try { qrcode.generate(update.qr, { small: true }); } catch { }
+        }
+      }
+      if (update.connection === 'open') {
+        reconnectAttempts.set(id, 0);
+        logger.info({ accountId: id, user: sock.user?.id }, 'WhatsApp account connected');
+        backupSession(account.sessionPath, logger);   // verified copy for the next hard kill
+        try { fs.rmSync(path.join(DATA_DIR, 'qr.txt'), { force: true }); } catch { }   // never resend a used QR
+        const selfJid = normalizeJid(sock.user?.id || '');
+        if (selfJid) {
+          const decision = decideConnectNotice({
+            policy: process.env.CONNECT_NOTICE,
+            state: {
+              announcedOnce: settings.noticeAnnouncedOnce,
+              lastNoticeAt: settings.lastConnectNotice,
+              lastRestartAlertAt: settings.lastRestartAlertAt,
+            },
+            boots: settings.bootTimes,
+          });
+          if (decision.announce) { settings.noticeAnnouncedOnce = true; settings.lastConnectNotice = Date.now(); }
+          if (decision.restartAlert) settings.lastRestartAlertAt = Date.now();
+          if (decision.announce || decision.restartAlert) {
+            saveSettings();
+            logger.info({ accountId: id, ...decision }, 'connect notice sent');
+            const aiOn = !!(process.env.GEMINI_API_KEY || process.env.AI_API_KEY);
+            const text = [
+              `✅ *${config.BOT_NAME}* සාර්ථකව connect වුණා!`,
+              '',
+              `👑 *Owner:* ${config.OWNER_NAME}`,
+              `📱 *Account:* +${selfJid.split('@')[0]}`,
+              `🔧 *Prefix:* ${PREFIX}`,
+              `🌐 *Mode:* ${settings.mode === 'private' ? 'Private (owner only)' : 'Public (හැමෝටම)'}`,
+              `🕒 *වෙලාව:* ${fmtTime(Date.now())}`,
+              '',
+              '📊 *දැනට තියෙන settings*',
+              `🛡️ Anti-delete / edit: ${settings.antiDelete ? 'ON ✅' : 'OFF ❌'}`,
+              `👋 Welcome / goodbye (groups): ${settings.welcome ? 'ON ✅' : 'OFF ❌'}`,
+              `🤖 AI (Gemini): ${aiOn ? 'ON ✅' : 'key නැහැ ❌'}`,
+              `🧩 Commands ගණන: ${commands.length}`,
+              '',
+              `📖 Commands බලන්න: *${PREFIX}menu*`,
+              `⚙️ Settings: *${PREFIX}antidelete on/off*, *${PREFIX}welcome on/off*`,
+              '',
+              'Bot එක දැන් වැඩ කරන්න ready! 🚀',
+              ...(decision.restartAlert ? [
+                '',
+                `⚠️ *මේ container එක පැයක් ඇතුළත ${decision.bootCount} වතාවක් restart වුණා.*`,
+                '_සාමාන්‍යයෙන් memory limit එකක් හෝ crash එකක් — Railway metrics බලන්න. Notice spam නවත්තලා මේක එක පාරක් විතරයි කියනවා._',
+              ] : []),
+            ].join('\n');
+            await sock.sendMessage(selfJid, { text }).catch(err => logger.warn({ err, accountId: id }, 'Owner notification failed'));
+          }
+        }
+        try { require('./lib/scheduler').start(id, sock, logger); } catch (err) { logger.warn({ err: err.message }, 'Scheduler failed to start'); }
+        // Keep presence available when presence.online is true. Refresh every 60s
+        // regardless of ALWAYS_ONLINE env so runtime `.online on/off` works reliably.
+        const announce = () => { if (!presence.online) return; sock.sendPresenceUpdate('available').catch(() => { }); };
+        if (presence.online) announce();
+        else sock.sendPresenceUpdate('unavailable').catch(() => { });
+        clearInterval(presenceTimers.get(id));
+        const timer = setInterval(announce, 60000);
+        timer.unref?.();
+        presenceTimers.set(id, timer);
+      }
+      if (update.connection === 'close') {
+        clearInterval(presenceTimers.get(id));
+        presenceTimers.delete(id);
+        try { require('./lib/scheduler').stop(id); } catch { }
+        try { sock.ev.removeAllListeners(); } catch { }
+        sockets.delete(id);
+        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+        if (statusCode === DisconnectReason.loggedOut) {
+          // The phone logged this device out (or WhatsApp revoked it): the saved login is useless now. Wipe it and start
+          // a fresh pairing automatically, so no shell access to the Railway volume is needed. Gives up after 3 resets
+          // in 10 minutes to avoid a loop.
+          const now = Date.now();
+          const recent = (global.__logoutResets = (global.__logoutResets || []).filter(t => now - t < 600000));
+          if (recent.length >= 3) { console.error('[SESSION] Logged out 3 times in 10 minutes — not resetting again. Check Linked devices on the phone, then redeploy.'); return; }
+          recent.push(now);
+          try {
+            for (const entry of fs.readdirSync(account.sessionPath)) fs.rmSync(path.join(account.sessionPath, entry), { recursive: true, force: true });
+            console.log('[SESSION] WhatsApp logged this device out. The saved login was wiped — a NEW pairing code will appear below, enter it in WhatsApp > Linked devices.');
+          } catch (err) { console.error('[SESSION] Could not wipe the old login:', err.message); }
+          clearTimeout(reconnectTimers.get(id));
+          reconnectTimers.set(id, setTimeout(() => connectAccount(account), 3000));
+          return;
+        }
+        const attempts = (reconnectAttempts.get(id) || 0) + 1;
+        reconnectAttempts.set(id, attempts);
+        // exponential backoff with jitter: a platform blip must not put every restart on the same second
+        const base = Math.min(60000, 1500 * (2 ** Math.min(attempts - 1, 5)));
+        const delay = Math.round(base * (1 + Math.random() * 0.25));
+        logger.warn({ accountId: id, statusCode, delay }, 'Connection closed; reconnect scheduled');
+        clearTimeout(reconnectTimers.get(id));
+        reconnectTimers.set(id, setTimeout(() => connectAccount(account), delay));
+      }
+    });
+    // Learn display names from WhatsApp's own contact sync so anti-delete/edit
+    // notices can show a saved name instead of a bare number when possible.
+    // (Coverage depends on how much WhatsApp syncs to this linked device.)
+    const cacheContacts = list => {
+      for (const c of list || []) {
+        const jid = normalizeJid(c.id);
+        if (c.lid) rememberLid(c.lid, jid.endsWith('@s.whatsapp.net') ? jid : '');
+        const name = c.name || c.notify || c.verifiedName;
+        if (jid && name) contactNames.set(jid, name);
+      }
+    };
+    sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => rememberLid(lid, jid));
+    sock.ev.on('contacts.upsert', cacheContacts);
+    sock.ev.on('contacts.update', cacheContacts);
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      // 'append' is used for messages synced from the owner's phone and for
+      // offline delivery. Those were previously ignored, which is why commands
+      // typed on the connected phone (self-chat) got no response. Accept fresh
+      // own messages from 'append', but never replay old history.
+      if (type !== 'notify' && type !== 'append') return;
+      stats.msgs += messages.length; stats.lastMsgAt = Date.now();
+      logger.debug({ accountId: id, type, count: messages.length }, 'messages.upsert');
+      for (const message of messages) {
+        if (type === 'append') {
+          const fresh = Date.now() - messageTimeMs(message) < 10 * 60000;
+          if (!message?.key?.fromMe || !fresh) continue;
+        }
+        const k = message?.key || {};
+        logger.debug({
+          accountId: id, chat: k.remoteJid, fromMe: !!k.fromMe,
+          contentType: message?.message ? getContentType(message.message) : 'none',
+        }, 'incoming message');
+        if (k.senderPn) rememberLid(k.remoteJid, k.senderPn);                 // DM from a LID with its phone number
+        if (k.participantPn) rememberLid(k.participant, k.participantPn);     // group message
+        if (message?.key?.id && message.message && !message.key.fromMe) {
+          const content = unwrapMessage(message.message);
+          const mt = getContentType(content);
+          const text = extractPreviewText(content);
+          recentMessages.set(message.key.id, {
+            key: message.key, chat: message.key.remoteJid, sender: normalizeJid(message.key.participant || message.key.remoteJid),
+            pushName: message.pushName || '', text: String(text || '').slice(0, 2000), type: mt, timestamp: Date.now(),
+            sentAt: messageTimeMs(message) || Date.now(),
+          });
+          if (recentMessages.size > MAX_CACHED_MESSAGES) recentMessages.delete(recentMessages.keys().next().value);
+          scheduleAntiDeleteSave();
+        }
+        require('./lib/viewonce').capture(message);   // async, fire-and-forget (memory only)
+        // Auto status view: silently mark every new status as seen (no read receipt shown to the poster).
+        if (k.remoteJid === 'status@broadcast') {
+          if (settings.autoStatus) { try { await sock.readMessages([message.key]); } catch { } }
+          continue;
+        }
+        try { await handleMessage(sock, account, message); }
+        catch (err) { console.error('[MESSAGE HANDLER FAILED]', err?.stack || err); logger.error({ err, accountId: id }, 'Message handler failed'); }
+      }
+    });
+    sock.ev.on('messages.update', async updates => {
+      if (process.env.ANTIDELETE_ENABLED === 'false' || !settings.antiDelete) return;
+      // Always report to the linked account's own self-chat (works even if BOT_OWNER is not set).
+      const owner = normalizeJid(sock.user?.id || '');
+      if (!owner) return;
+      for (const item of updates || []) {
+        const update = item.update || {};
+        // Baileys normalizes a WhatsApp "delete for everyone" (REVOKE) into a
+        // messages.update item with update.message === null and
+        // update.messageStubType === REVOKE — it is NOT delivered as
+        // update.message.protocolMessage. An edit instead arrives with
+        // update.message set to the new content. Key placement also varies
+        // between event shapes, so every plausible location is checked.
+        const msgId = item.key?.id || item.id || update.key?.id;
+        if (!msgId) continue;
+        const cached = recentMessages.get(msgId);
+        if (!cached) continue; // nothing we observed to report
+        const isRevoke = update.messageStubType === WAMessageStubType.REVOKE || (update.message === null && update.messageStubType !== undefined);
+        const isEdit = !isRevoke && !!update.message;
+        if (!isRevoke && !isEdit) continue;
+        const name = displayNameFor(cached.sender, cached.pushName);
+        let chatLabel = '👤 Private chat';
+        if (String(cached.chat).endsWith('@g.us')) {
+          const gm = await sock.groupMetadata(cached.chat).catch(() => null);
+          chatLabel = `👥 Group: ${gm?.subject || cached.chat}`;
+        }
+        if (isRevoke) {
+          recentMessages.delete(msgId);
+          const count = (senderDeleteCounts.get(cached.sender) || 0) + 1;
+          senderDeleteCounts.set(cached.sender, count);
+          const who = describePerson(cached.sender, cached.pushName);
+          // In groups an admin can delete someone else's message: the revoke is then sent by a different person.
+          const deleter = normalizeJid(item.key?.participant || update.key?.participant || '');
+          let deletedByLine = '';
+          if (deleter && deleter !== cached.sender && String(cached.chat).endsWith('@g.us')) {
+            const dPhone = phoneFor(deleter);
+            deletedByLine = `🛡️ Deleted by (admin): ${displayNameFor(deleter, '')}${dPhone ? ` (+${dPhone})` : ''} @${deleter.split('@')[0]}`;
+            who.mentions.push(deleter);
+          }
+          const note = [
+            '🛡️ *Anti-delete notice*',
+            `📍 ${chatLabel}`,
+            who.text,
+            deletedByLine,
+            `🕒 Sent: ${fmtTime(cached.sentAt || cached.timestamp)}`,
+            `🗑️ Deleted: ${fmtTime(Date.now())}`,
+            `🔁 Deleted messages from this sender (this session): ${count}`,
+            `🧾 Type: ${cached.type || 'message'}`,
+            `💬 Text: ${cached.text || '[No text / media message]'}`,
+            '',
+            'ℹ️ Only messages cached while the bot was online can be reported; deleted media is not guaranteed to be recoverable.',
+          ].filter(Boolean).join('\n');
+          await sock.sendMessage(owner, { text: note, mentions: who.mentions }).catch(err => logger.warn({ err, accountId: id }, 'Anti-delete owner notice failed'));
+          if (supabase) {
+            try { await supabase.from(process.env.SUPABASE_AUDIT_TABLE || 'bot_audit_events').insert({ account_id: id, event_type: 'message_deleted', chat_jid: cached.chat, sender_jid: cached.sender, message_type: cached.type || 'message', message_text: cached.text || null, created_at: new Date().toISOString() }); }
+            catch (err) { logger.warn({ err: err.message }, 'Supabase audit insert failed; ensure table/schema exists'); }
+          }
+        } else {
+          // Baileys wraps an edit's new content as { editedMessage: { message: <actual content> } },
+          // not as the content directly — unwrap that layer before extracting text.
+          const editedPayload = update.message?.editedMessage?.message || update.message;
+          const newContent = unwrapMessage(editedPayload);
+          const newText = extractPreviewText(newContent) || '[No text / media message]';
+          const count = (senderEditCounts.get(cached.sender) || 0) + 1;
+          senderEditCounts.set(cached.sender, count);
+          const whoEdit = describePerson(cached.sender, cached.pushName);
+          const note = [
+            '✏️ *Message edited*',
+            `📍 ${chatLabel}`,
+            whoEdit.text,
+            `🕒 Sent: ${fmtTime(cached.sentAt || cached.timestamp)}`,
+            `✏️ Edited: ${fmtTime(Date.now())}`,
+            `🔁 Edited messages from this sender (this session): ${count}`,
+            `🕰️ Before: ${cached.text || '[No text / media message]'}`,
+            `🆕 After: ${String(newText).slice(0, 2000)}`,
+          ].join('\n');
+          cached.text = String(newText).slice(0, 2000); // keep cache current for a later delete/edit report
+          await sock.sendMessage(owner, { text: note, mentions: whoEdit.mentions }).catch(err => logger.warn({ err, accountId: id }, 'Anti-edit owner notice failed'));
+          if (supabase) {
+            try { await supabase.from(process.env.SUPABASE_AUDIT_TABLE || 'bot_audit_events').insert({ account_id: id, event_type: 'message_edited', chat_jid: cached.chat, sender_jid: cached.sender, message_type: cached.type || 'message', message_text: String(newText).slice(0, 2000), created_at: new Date().toISOString() }); }
+            catch (err) { logger.warn({ err: err.message }, 'Supabase audit insert failed; ensure table/schema exists'); }
+          }
+        }
+      }
+    });
+    sock.ev.on('group-participants.update', async event => {
+      if (!event?.id) return;
+      const meta = await sock.groupMetadata(event.id).catch(() => null);
+      if (!meta) return;
+      for (const jid of event.participants || []) {
+        const message = welcomePolicy.messageFor(event.action, jid, { ...meta, id: event.id }, settings);
+        if (!message) continue;
+        await sock.sendMessage(event.id, { text: message.text, mentions: message.mentions })
+          .catch(err => logger.debug({ err: err.message, accountId: id }, 'Welcome/goodbye send failed'));
+      }
+    });
+  } catch (err) {
+    sockets.delete(id);
+    logger.error({ err, accountId: id }, 'Could not start account');
+    const attempts = (reconnectAttempts.get(id) || 0) + 1;
+    reconnectAttempts.set(id, attempts);
+    const base = Math.min(60000, 3000 * (2 ** Math.min(attempts - 1, 4)));
+    const delay = Math.round(base * (1 + Math.random() * 0.25));   // jitter, same reason as above
+    clearTimeout(reconnectTimers.get(id));
+    reconnectTimers.set(id, setTimeout(() => connectAccount(account), delay));
+  }
+}
+
+const app = express();
+app.get('/', (_req, res) => res.status(200).json({ status: 'ok' }));
+// YouTube path verification: GET /api/yt-test?id=<videoId>&token=<TEST_TOKEN>. Runs the real yt-dlp
+// pipeline inside this container and reports the format count, so "is YouTube still blocking us?" is a
+// curl away instead of a WhatsApp round trip with the owner.
+// Constant-time token check: these endpoints are reachable from the internet, so never compare secrets
+// with `===` and never disclose whether a token exists at all.
+const tokenMatches = given => {
+  const expected = String(process.env.TEST_TOKEN || '');
+  if (!expected) return false;
+  const a = Buffer.from(String(given || '')); const b = Buffer.from(expected);
+  return a.length === b.length && require('crypto').timingSafeEqual(a, b);
+};
+
+app.get('/api/yt-test', async (req, res) => {
+  if (!tokenMatches(req.query.token)) return res.status(403).json({ error: 'forbidden' });
+  try {
+    if (String(req.query.dl || '') === '1') {
+      const { probeDownload } = require('./plugins/download');
+      return res.json(await probeDownload(String(req.query.id || 'dQw4w9WgXcQ')));
+    }
+    if (String(req.query.raw || '') === '1') {
+      const { probeRaw } = require('./plugins/download');
+      return res.json(await probeRaw(String(req.query.id || 'dQw4w9WgXcQ')));
+    }
+    const { probeYouTube } = require('./plugins/download');
+    return res.json(await probeYouTube(String(req.query.id || 'dQw4w9WgXcQ')));
+  } catch (err) { return res.status(500).json({ error: String(err?.message || err).slice(0, 200) }); }
+});
+
+app.get('/health', (req, res) => {
+  // Public health = status + counts only: Railway's check needs nothing else, and filesystem paths plus a
+  // listing of the volume's contents are internal detail. The diagnostics stay behind the same token as
+  // the YouTube probe (used by the audit tooling, never by the platform).
+  const base = { status: 'ok', connected: sockets.size, configured: configuredAccounts?.length || 0 };
+  if (!tokenMatches(req.query.token)) return res.status(200).json(base);
+  const disk = {};
+  const dirs = {
+    downloads: process.env.FILM_DOWNLOAD_DIR || path.join(STORAGE_DIR, 'data', 'films'),
+    tmpdir: os.tmpdir(),
+    data: STORAGE_DIR,
+  };
+  for (const [name, dir] of Object.entries(dirs)) {
+    try {
+      const st = fs.statfsSync(dir);
+      const free = Number(st.bavail) * Number(st.bsize);
+      const total = Number(st.blocks) * Number(st.bsize);
+      disk[name] = { dir, freeMB: Math.round(free / 1e6), totalMB: Math.round(total / 1e6) };
+    } catch (err) { disk[name] = { dir, error: err.message }; }
+  }
+  const biggest = [];
+  (function walk(dir, depth) {
+    if (depth > 4) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      try {
+        if (e.isDirectory()) { walk(full, depth + 1); continue; }
+        const st = fs.statSync(full);
+        if (st.size > 2e6) biggest.push({ path: full, mb: Math.round(st.size / 1e6) });
+      } catch { }
+    }
+  })(STORAGE_DIR, 0);
+  biggest.sort((a, b) => b.mb - a.mb);
+  res.status(200).json({
+    status: 'ok', connected: sockets.size, configured: configuredAccounts?.length || 0,
+    disk, volumeFiles: biggest.slice(0, 6),
+  });
+});
+const server = app.listen(PORT, '0.0.0.0', () => logger.info(`Health server listening on ${PORT}`));
+let configuredAccounts;
+try {
+  configuredAccounts = readAccounts();
+  logger.info({ accounts: configuredAccounts.map(a => a.id) }, 'Configured WhatsApp accounts');
+  for (const account of configuredAccounts) connectAccount(account);
+} catch (err) {
+  logger.error({ err }, 'Invalid account configuration');
+  server.close(() => process.exit(1));
+}
+async function shutdown(signal) {
+  logger.info({ signal }, 'Shutting down');
+  console.log(`[SHUTDOWN] ${signal} received — the platform (Railway) asked this container to stop (redeploy / restart / scale).`);
+  recordExit(`${signal} (stopped by Railway: redeploy, restart or maintenance)`);
+  for (const timer of reconnectTimers.values()) clearTimeout(timer);
+  for (const sock of sockets.values()) { try { sock.end(undefined); } catch {} }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 8000).unref();
+}
+// ───────── Why did the bot restart? ─────────
+// Every minute we note that we are alive (+ memory use). On the next start we print how the previous run ended:
+// a clean stop (SIGTERM = Railway redeploy/restart), a crash (error text) or "killed without warning"
+// (almost always the container ran out of memory).
+const STATE_FILE = path.join(DATA_DIR, 'run-state.json');
+const readState = () => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return null; } };
+const writeState = patch => {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const cur = readState() || {};
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ ...cur, ...patch }));
+  } catch { /* best effort */ }
+};
+let exitRecorded = false;
+function recordExit(reason) {
+  if (exitRecorded) return; exitRecorded = true;
+  writeState({ exit: { reason, at: Date.now() }, lastAlive: Date.now() });
+}
+{
+  const prev = readState();
+  if (prev?.startedAt) {
+    const up = Math.round(((prev.exit?.at || prev.lastAlive || prev.startedAt) - prev.startedAt) / 60000);
+    if (prev.exit) console.log(`[BOOT] previous run ended: ${prev.exit.reason} — it had been up ${up} min (stopped ${fmtTime(prev.exit.at)}).`);
+    else console.error(`[BOOT] previous run was KILLED WITHOUT WARNING after ~${up} min (last seen alive ${fmtTime(prev.lastAlive || prev.startedAt)}, memory then ${prev.rssMB || '?'} MB). A Railway deploy/replacement kills the old container this way, and so does an OOM kill or a segfault — check the deployment timestamps and the Railway metrics before blaming memory.`);
+  } else console.log('[BOOT] first start (no previous run recorded).');
+  writeState({ startedAt: Date.now(), lastAlive: Date.now(), exit: null, rssMB: Math.round(process.memoryUsage().rss / 1048576) });
+}
+process.on('exit', code => recordExit(`process exit (code ${code})`));
+const crashTimes = [];
+process.on('uncaughtException', err => {
+  console.error('[UNCAUGHT EXCEPTION]', err?.stack || err);
+  const now = Date.now(); crashTimes.push(now);
+  while (crashTimes.length && now - crashTimes[0] > 600000) crashTimes.shift();
+  recordExit(`crash: ${String(err?.message || err).slice(0, 200)}`);
+  exitRecorded = false;                                     // keep running unless it keeps happening
+  if (crashTimes.length >= 5) { console.error('[UNCAUGHT EXCEPTION] 5 in 10 minutes — exiting so Railway restarts a clean process.'); process.exit(1); }
+});
+setInterval(() => writeState({ lastAlive: Date.now(), rssMB: Math.round(process.memoryUsage().rss / 1048576) }), 60000).unref();
+
+// Heartbeat every 5 min. Baileys already pings WhatsApp and reconnects by itself when the connection drops, so we only
+// restart the process if an account has stayed disconnected for 10+ minutes.
+const downSinceMap = new Map();
+setInterval(() => {
+  const ids = new Set([...sockets.keys(), ...reconnectTimers.keys()]);
+  const rss = Math.round(process.memoryUsage().rss / 1048576);
+  for (const id of ids) {
+    if (!sockets.get(id)) {
+      const since = downSinceMap.get(id) || Date.now();
+      downSinceMap.set(id, since);
+      if (Date.now() - since > 10 * 60000) { console.error(`[WATCHDOG] ${id} disconnected for 10+ min, restarting`); recordExit(`watchdog: ${id} disconnected for 10+ minutes`); process.exit(1); }
+      continue;
+    }
+    downSinceMap.delete(id);
+    const last = stats.lastMsgAt ? `${Math.round((Date.now() - stats.lastMsgAt) / 60000)} min ago` : 'never';
+    console.log(`[HEARTBEAT] ${id}: connected | up ${Math.round(process.uptime() / 60)} min | memory ${rss} MB | messages=${stats.msgs}, last=${last} | hidden signal-noise=${stats.noise}`);
+  }
+}, 5 * 60000).unref();
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
